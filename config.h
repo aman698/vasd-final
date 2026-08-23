@@ -72,28 +72,41 @@ byte SERVER_MAC[] = {
 const int ip_array[4] = {192, 168, 0, 125};
 const int gateway_array[4] = {192, 168, 0, 1};
 const int subnet_array[4] = {255, 255, 255, 0};
-// NTP server is addressed by numeric IP, but Ethernet.begin() still requires a DNS value.
 const int dns_array[4] = {192, 168, 0, 1};
 
-// Local time zone offset from UTC, used to convert NTP (UTC) time to wall-clock
-// time on the display. IST = UTC+5:30.
+// Used only when EEPROM has no valid PC Timer IP yet (first boot / old firmware).
+// Same host that used to act as the local NTP server.
+const int default_pc_timer_ip_array[4] = {192, 168, 0, 11};
+
+// Local time zone offset from UTC, used to convert the PC-supplied UTC unix
+// time to wall-clock time on the display. IST = UTC+5:30.
 #define TIME_ZONE_OFFSET_SECONDS (5 * 3600 + 30 * 60)
 
 /*
-   EEPROM LAYOUT (EEPROM.begin(64) - 64 bytes available, this uses 0-14)
-   IP octets   : bytes 0-3   (EEPROM_IP_ADDR .. +3)
-   Server port : byte  5     (EEPROM_PORT_ADDR)
+   EEPROM LAYOUT (EEPROM.begin(64) - 64 bytes available, this uses 0-24)
+   MCU IP octets       : bytes 0-3   (EEPROM_IP_ADDR .. +3)
+   MCU server port     : byte  5     (EEPROM_PORT_ADDR)
    (bytes 6-9 reserved/unused - kept clear as a gap)
-   Last synced NTP unix time : bytes 10-13 (EEPROM_TIME_ADDR, unsigned long, 4 bytes)
-   Time-valid flag           : byte  14 (EEPROM_TIME_VALID_ADDR, EEPROM_TIME_VALID_MAGIC = valid)
-   Each block has its own address range so a SET,ip command can never
-   overwrite the saved time, and an NTP sync can never overwrite the IP.
+   PC Timer IP octets  : bytes 10-13 (EEPROM_TIMER_PC_IP_ADDR .. +3)
+   PC Timer IP valid   : byte  14    (EEPROM_TIMER_PC_IP_VALID_ADDR, EEPROM_TIMER_PC_IP_VALID_MAGIC = valid)
+   (bytes 15-19 reserved/unused - kept clear as a gap)
+   Last known unix time: bytes 20-23 (EEPROM_TIME_ADDR, unsigned long, 4 bytes)
+   Time-valid flag     : byte  24    (EEPROM_TIME_VALID_ADDR, EEPROM_TIME_VALID_MAGIC = valid)
+
+   Each block has its own address range so a SET command can never overwrite
+   the PC Timer IP or the saved time, a TIMERIP command can never overwrite
+   the MCU IP, and a time sync can never overwrite either IP.
 */
-#define EEPROM_IP_ADDR          0
-#define EEPROM_PORT_ADDR        5
-#define EEPROM_TIME_ADDR        10
-#define EEPROM_TIME_VALID_ADDR  14
-#define EEPROM_TIME_VALID_MAGIC 0xAA
+#define EEPROM_IP_ADDR                 0
+#define EEPROM_PORT_ADDR               5
+
+#define EEPROM_TIMER_PC_IP_ADDR        10
+#define EEPROM_TIMER_PC_IP_VALID_ADDR  14
+#define EEPROM_TIMER_PC_IP_VALID_MAGIC 0xBB
+
+#define EEPROM_TIME_ADDR               20
+#define EEPROM_TIME_VALID_ADDR         24
+#define EEPROM_TIME_VALID_MAGIC        0xAA
 
 /*
    SERIAL CONFIGS

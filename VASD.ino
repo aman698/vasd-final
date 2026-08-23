@@ -60,13 +60,14 @@ const uint16_t* bitmaps[] = {flag};
 unsigned long timerStart = 0;
 EthernetUDP ntpUDP;
 
-// Public NTP servers are unreachable from this network segment (192.168.0.x has
-// no internet gateway) - use the PC on the same subnet as a local NTP source.
-IPAddress ntpServer(192, 168, 0, 11);   // PC acting as local NTP server
+// The PC NTP server IP is no longer hardcoded here - it is read from EEPROM
+// (falls back to config.h's default_pc_timer_ip_array) inside syncNTPTime().
 const unsigned int NTP_PORT = 123;
 
-unsigned long ntpTime = 0;
-bool ntpSynced = false;
+// Base time used by the display timer. Still obtained via NTP - only the
+// variable names were generalized (previously ntpTime / ntpSynced).
+unsigned long baseUnixTime = 0;
+bool timeSynced = false;
 
 struct adc {
   volatile uint32_t CS, RESULT,
@@ -137,6 +138,10 @@ void printAlive();
 void writeToDisplay();
 void drawImage(int imageSize);
 void clearDisplay(int x1, int x2, int y1, int y2);
+bool loadPCTimerIP(IPAddress &ip);
+void savePCTimerIP(byte o0, byte o1, byte o2, byte o3);
+bool isValidOctet(const String &s);
+bool syncNTPTime();
 
 void clearDisplay(int x1, int y1, int x2, int y2) {
   int i = x1;
@@ -154,16 +159,16 @@ void drawTimeCounter()
 {
     unsigned long displaySeconds;
 
-    if (ntpSynced)
+    if (timeSynced)
     {
-        // Wall-clock time: NTP unix time at sync + seconds elapsed since sync,
+        // Wall-clock time: unix time at sync + seconds elapsed since sync,
         // converted from UTC to local time-of-day.
-        unsigned long currentUnixTime = ntpTime + (millis() - timerStart) / 1000;
+        unsigned long currentUnixTime = baseUnixTime + (millis() - timerStart) / 1000;
         displaySeconds = (currentUnixTime + TIME_ZONE_OFFSET_SECONDS) % 86400UL;
     }
     else
     {
-        // No valid NTP time yet - fall back to elapsed-since-boot stopwatch.
+        // No valid time yet - fall back to elapsed-since-boot stopwatch.
         displaySeconds = (millis() - timerStart) / 1000;
     }
 
@@ -247,9 +252,9 @@ void writeToDisplay(int x, int y, String text, int fontColour, int fontSize) {
   PANEL.setTextColor(fclr, BLACK);
   PANEL.drawStringX(x, y, buf, fclr, 0);
 }
-// Persist the last successfully synced NTP time in its own EEPROM block
-// (bytes 10-14, separate from the IP/port block at bytes 0-5) so a power
-// cycle can restore it even if a fresh NTP sync isn't available yet.
+// Persist the last successfully synced time in its own EEPROM block,
+// separate from the MCU IP/port and PC Timer IP blocks, so a power cycle
+// can restore it even if a fresh PC sync isn't available yet.
 void saveTimeToEEPROM(unsigned long unixTime)
 {
     EEPROM.put(EEPROM_TIME_ADDR, unixTime);
@@ -266,8 +271,69 @@ bool loadTimeFromEEPROM(unsigned long &unixTime)
     return true;
 }
 
+// Reads the PC NTP server IP from EEPROM. Returns false if none has ever
+// been saved (fresh EEPROM, or EEPROM still holding data from older
+// firmware that never wrote this block/magic byte) - the caller decides
+// the fallback (config.h's default_pc_timer_ip_array).
+bool loadPCTimerIP(IPAddress &ip)
+{
+    if (EEPROM.read(EEPROM_TIMER_PC_IP_VALID_ADDR) != EEPROM_TIMER_PC_IP_VALID_MAGIC)
+        return false;
+
+    ip = IPAddress(EEPROM.read(EEPROM_TIMER_PC_IP_ADDR + 0),
+                   EEPROM.read(EEPROM_TIMER_PC_IP_ADDR + 1),
+                   EEPROM.read(EEPROM_TIMER_PC_IP_ADDR + 2),
+                   EEPROM.read(EEPROM_TIMER_PC_IP_ADDR + 3));
+    return true;
+}
+
+// Stores the PC NTP server IP in its own EEPROM block. Never touches the
+// MCU IP/port block or the saved-time block. Single commit for the whole
+// 4-octet + magic-byte write.
+void savePCTimerIP(byte o0, byte o1, byte o2, byte o3)
+{
+    EEPROM.write(EEPROM_TIMER_PC_IP_ADDR + 0, o0);
+    EEPROM.write(EEPROM_TIMER_PC_IP_ADDR + 1, o1);
+    EEPROM.write(EEPROM_TIMER_PC_IP_ADDR + 2, o2);
+    EEPROM.write(EEPROM_TIMER_PC_IP_ADDR + 3, o3);
+    EEPROM.write(EEPROM_TIMER_PC_IP_VALID_ADDR, EEPROM_TIMER_PC_IP_VALID_MAGIC);
+    EEPROM.commit();
+}
+
+// Rejects anything that isn't a plain decimal integer in [0, 255], so a
+// malformed SET/TIMERIP command can never write garbage into the IP EEPROM
+// blocks (String::toInt() silently returns 0 for non-numeric input).
+bool isValidOctet(const String &s)
+{
+    if (s.length() == 0 || s.length() > 3)
+        return false;
+
+    for (unsigned int i = 0; i < s.length(); i++)
+    {
+        if (!isDigit(s[i]))
+            return false;
+    }
+
+    int v = s.toInt();
+    return v >= 0 && v <= 255;
+}
+
+// Original UDP NTP request/response, unchanged, except the server IP is now
+// read from EEPROM (via loadPCTimerIP()) instead of being hardcoded, and the
+// result is stored in baseUnixTime/timeSynced (previously ntpTime/ntpSynced).
 bool syncNTPTime()
 {
+    IPAddress ntpServer;
+    if (!loadPCTimerIP(ntpServer))
+    {
+        // No PC NTP IP configured yet - fall back to the compiled-in default
+        // so a fresh/blank EEPROM still has something to try until a
+        // TIMERIP command sets one.
+        ntpServer = IPAddress(default_pc_timer_ip_array[0], default_pc_timer_ip_array[1],
+                              default_pc_timer_ip_array[2], default_pc_timer_ip_array[3]);
+        Serial.println("PC NTP IP not set in EEPROM - using compiled-in default.");
+    }
+
     const int NTP_PACKET_SIZE = 48;
     byte packetBuffer[NTP_PACKET_SIZE];
 
@@ -284,7 +350,7 @@ bool syncNTPTime()
     packetBuffer[14] = 49;
     packetBuffer[15] = 52;
 
-    ntpSynced = false;
+    timeSynced = false;
 
     Serial.println("----- NTP DEBUG -----");
     Serial.print("Local IP: ");
@@ -369,16 +435,16 @@ bool syncNTPTime()
 
             const unsigned long seventyYears = 2208988800UL;
 
-            ntpTime = secondsSince1900 - seventyYears;
+            baseUnixTime = secondsSince1900 - seventyYears;
 
             ntpUDP.stop();
 
             Serial.println("NTP sync succeeded");
             Serial.print("Unix time: ");
-            Serial.println(ntpTime);
+            Serial.println(baseUnixTime);
 
-            ntpSynced = true;
-            saveTimeToEEPROM(ntpTime);
+            timeSynced = true;
+            saveTimeToEEPROM(baseUnixTime);
 
             return true;
         }
@@ -503,13 +569,15 @@ void checkHardReset() {
       triggered = false;
     }
     else if (!triggered && millis() - lowSince > 10000) {
-      EEPROM.write(EEPROM_IP_ADDR + 0, 192); EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 1, 168); EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 2, 0);   EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 3, 125); EEPROM.commit();
-      EEPROM.write(EEPROM_PORT_ADDR, 255);   EEPROM.commit();
+      // Resets the MCU IP/port to defaults only. The PC Timer IP
+      // (EEPROM_TIMER_PC_IP_ADDR block) is intentionally left untouched.
+      EEPROM.write(EEPROM_IP_ADDR + 0, 192);
+      EEPROM.write(EEPROM_IP_ADDR + 1, 168);
+      EEPROM.write(EEPROM_IP_ADDR + 2, 0);
+      EEPROM.write(EEPROM_IP_ADDR + 3, 125);
+      EEPROM.write(EEPROM_PORT_ADDR, 255);
+      EEPROM.commit();
       triggered = true;
-//      NVIC_SystemReset();
     }
   }
   else {
@@ -549,23 +617,58 @@ int parseCommand(String str) {
       // trailing comma or any time field in the command.
       String fifthValue1  = str.substring(fourthCommaIndex1 + 1);
 
-      EEPROM.write(EEPROM_IP_ADDR + 0, secondValue1.toInt()); EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 1, thirdValue1.toInt());  EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 2, fourthValue1.toInt()); EEPROM.commit();
-      EEPROM.write(EEPROM_IP_ADDR + 3, fifthValue1.toInt());  EEPROM.commit();
-
-      IPAddress newIP(secondValue1.toInt(), thirdValue1.toInt(),
-                      fourthValue1.toInt(), fifthValue1.toInt());
-      configureEthernet(newIP);
-
-      if (syncNTPTime())
+      if (!isValidOctet(secondValue1) || !isValidOctet(thirdValue1) ||
+          !isValidOctet(fourthValue1) || !isValidOctet(fifthValue1))
       {
-        timerStart = millis();
-        Serial.println("Timer reset to 00:00:00 after NTP synchronization");
+        Serial.println("SET rejected: malformed IP.");
       }
       else
       {
-        Serial.println("Timer was not reset because NTP synchronization failed");
+        EEPROM.write(EEPROM_IP_ADDR + 0, secondValue1.toInt());
+        EEPROM.write(EEPROM_IP_ADDR + 1, thirdValue1.toInt());
+        EEPROM.write(EEPROM_IP_ADDR + 2, fourthValue1.toInt());
+        EEPROM.write(EEPROM_IP_ADDR + 3, fifthValue1.toInt());
+        EEPROM.commit();
+
+        IPAddress newIP(secondValue1.toInt(), thirdValue1.toInt(),
+                        fourthValue1.toInt(), fifthValue1.toInt());
+        configureEthernet(newIP);
+
+        // SET only changes the MCU's own IP. It no longer touches the timer -
+        // time still comes from NTP (see syncNTPTime()) and is synced once at boot.
+        Serial.print("MCU IP updated: ");
+        Serial.println(newIP);
+      }
+    }
+    else if (firstValue == "TIMERIP") {
+      int commaIndex1 = str.indexOf(',');
+      int secondCommaIndex1 = str.indexOf(',', commaIndex1 + 1);
+      int thirdCommaIndex1 = str.indexOf(',', secondCommaIndex1 + 1);
+      int fourthCommaIndex1 = str.indexOf(',', thirdCommaIndex1 + 1);
+
+      String secondValue1 = str.substring(commaIndex1 + 1, secondCommaIndex1);
+      String thirdValue1 = str.substring(secondCommaIndex1 + 1, thirdCommaIndex1);
+      String fourthValue1 = str.substring(thirdCommaIndex1 + 1, fourthCommaIndex1);
+      // Fourth octet is the remainder of TIMERIP,a,b,c,d - no trailing comma required.
+      String fifthValue1  = str.substring(fourthCommaIndex1 + 1);
+
+      if (!isValidOctet(secondValue1) || !isValidOctet(thirdValue1) ||
+          !isValidOctet(fourthValue1) || !isValidOctet(fifthValue1))
+      {
+        Serial.println("TIMERIP rejected: malformed IP.");
+      }
+      else
+      {
+        savePCTimerIP(secondValue1.toInt(), thirdValue1.toInt(),
+                      fourthValue1.toInt(), fifthValue1.toInt());
+
+        // Only the PC NTP IP is stored here. It is NOT applied immediately -
+        // it takes effect on the next syncNTPTime() call (i.e. next boot).
+        Serial.print("PC NTP IP updated: ");
+        Serial.print(secondValue1); Serial.print(".");
+        Serial.print(thirdValue1);  Serial.print(".");
+        Serial.print(fourthValue1); Serial.print(".");
+        Serial.println(fifthValue1);
       }
     }
     else if (firstValue == "SPEED") {
@@ -582,37 +685,11 @@ int parseCommand(String str) {
 
       displaySpeed(vehicle_speed, colorCase);
 
-      server.print(vehicle_speed);
-      server.print(" ");
-      server.print(colorCase);
-    }
-    else if (firstValue == "CLEAR") {
-      int packetIndex1 = str.indexOf(',');
-      int packetIndex2 = str.indexOf(',', packetIndex1 + 1);
-      int packetIndex3 = str.indexOf(',', packetIndex2 + 1);
-      int packetIndex4 = str.indexOf(',', packetIndex3 + 1);
-      int packetIndex5 = str.indexOf(',', packetIndex4 + 1);
-
-      String packetValue1 = str.substring(0, packetIndex1);
-      String packetValue2 = str.substring(packetIndex1 + 1, packetIndex2);
-      String packetValue3 = str.substring(packetIndex2 + 1, packetIndex3);
-      String packetValue4 = str.substring(packetIndex3 + 1, packetIndex4);
-      String packetValue5 = str.substring(packetIndex4 + 1, packetIndex5);
-
-      int x1 = packetValue2.toInt();
-      int y1 = packetValue3.toInt();
-      int x2 = packetValue4.toInt();
-      int y2 = packetValue5.toInt();
-
-      int i = x1;
-      while (y1 < y2) {
-        while (i < x2) {
-          PANEL.drawPixel(i, y1, BLACK);
-          i++;
-        }
-        y1++;
-        i = x1;
-      }
+      // Respond to the requesting connection specifically, not server.print()
+      // (which is an EthernetServer broadcast to every connected client).
+      client.print(vehicle_speed);
+      client.print(" ");
+      client.print(colorCase);
     }
   }
   return -1;
@@ -673,23 +750,26 @@ void setup() {
   Serial.println(Ethernet.localIP());
 
   // Network has settled (configureEthernet() already waited 500ms after
-  // Ethernet.begin()) - attempt boot-time NTP sync.
+  // Ethernet.begin()) - attempt the one-and-only boot-time NTP sync.
+  // This is intentionally called here only, never from loop().
   if (syncNTPTime())
   {
     timerStart = millis();
-    Serial.println("Timer reset to 00:00:00 after boot NTP synchronization");
+    Serial.println("Timer initialized from PC NTP time.");
   }
   else
   {
-    Serial.println("Boot NTP synchronization failed");
+    Serial.println("Boot NTP synchronization failed.");
     unsigned long savedTime;
     if (loadTimeFromEEPROM(savedTime))
     {
-      ntpTime = savedTime;
-      ntpSynced = true;
+      // Last-known-time fallback only: this cannot know how long the MCU
+      // was powered off, so the restored time is stale by that amount.
+      baseUnixTime = savedTime;
+      timeSynced = true;
       timerStart = millis();
-      Serial.print("Restored last known synced time from EEPROM. Unix time: ");
-      Serial.println(ntpTime);
+      Serial.print("Restored last known time from EEPROM. Unix time: ");
+      Serial.println(baseUnixTime);
       Serial.println("Note: this time is stale by however long the device was powered off.");
     }
     else
