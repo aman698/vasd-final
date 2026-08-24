@@ -142,6 +142,10 @@ bool loadPCTimerIP(IPAddress &ip);
 void savePCTimerIP(byte o0, byte o1, byte o2, byte o3);
 bool isValidOctet(const String &s);
 bool syncNTPTime();
+void getSpeedNumberRect(int vehicleSpeed, int &x, int &y, int &w, int &h);
+void drawSpeedNumber(int vehicleSpeed, int color);
+void blankSpeedNumber(int vehicleSpeed);
+void updateOverspeedBlink();
 
 void clearDisplay(int x1, int y1, int x2, int y2) {
   int i = x1;
@@ -488,9 +492,97 @@ void Headline(const char* text, int color) {
   PANEL.swapBuffers(true);
 }
 
+// ---- SPEED display / overspeed blink thresholds ----
+#define OVERSPEED_LIMIT 100
+#define BLINK_SPEED_LIMIT 120
+#define OVERSPEED_BLINK_DURATION 5000UL
+#define BLINK_INTERVAL 500UL
+
+// State for the non-blocking overspeed blink, updated by displaySpeed() and
+// consumed every loop() iteration by updateOverspeedBlink(). Only the speed
+// NUMBER blinks - the OVERSPEED/YOUR SPEED headline drawn by Headline() is
+// never touched here.
+int currentSpeedValue = 0;
+int currentSpeedColor = WHITE;
+bool speedBlinkActive = false;      // true while the 5s blink window is running
+bool speedNumberVisible = true;     // current blink phase (drawn vs blanked)
+unsigned long speedBlinkStart = 0;      // millis() when blinking (re)started
+unsigned long speedBlinkLastToggle = 0; // millis() of the last visible/blank toggle
+
+// Y coordinate drawTimeCounter() draws the clock at (PANEL.drawStringX(61, 80, ...)).
+// drawTimeCounter() itself is off-limits to change, so this is kept as a named
+// constant here purely so the speed-number blank rectangle below can never reach
+// down into the timer's row.
+#define TIMER_DISPLAY_Y 80
+
+// Computes the exact same speed-number position displaySpeed() has always used
+// (x/y depend on digit count, unchanged), plus a width/height for just the area
+// the number occupies - derived from FONT64's own declared cell size (FONT64_WIDTH
+// / FONT64_HEIGHT), clipped so it never extends past the panel edge or down into
+// TIMER_DISPLAY_Y. Both drawSpeedNumber() and blankSpeedNumber() use this so the
+// "where is the speed number" calculation only exists in one place.
+void getSpeedNumberRect(int vehicleSpeed, int &x, int &y, int &w, int &h) {
+  int n = vehicleSpeed, digitCount = 0;
+  do {
+    n /= 10;
+    ++digitCount;
+  } while (n != 0);
+
+  n = vehicleSpeed;
+  char s[20];
+  sprintf (s, "%ld", n);
+  int first_digit = s[0] - '0';
+
+  x = 0; y = 20;
+  if (digitCount == 1) {
+    x = 45;
+  }
+  else if (digitCount == 2) {
+    x = 25;
+  }
+  else if (digitCount == 3) {
+    if (first_digit == 1) {
+      x = 15;
+    } else if (first_digit > 1) {
+      x = 5;
+    }
+  }
+
+  w = digitCount * FONT64_WIDTH;
+  if (x + w > 128) w = 128 - x;
+
+  h = FONT64_HEIGHT;
+  if (y + h > TIMER_DISPLAY_Y) h = TIMER_DISPLAY_Y - y;
+}
+
+// Draws just the speed number glyph (unchanged font/positioning/color logic
+// from the original displaySpeed()).
+void drawSpeedNumber(int vehicleSpeed, int color) {
+  PANEL.selectFont(&font29);
+
+  int x, y, w, h;
+  getSpeedNumberRect(vehicleSpeed, x, y, w, h);
+
+  char sp[10] = "";
+  sprintf(sp, "%d" , vehicleSpeed);
+
+  PANEL.setTextColor(color, BLACK);
+  PANEL.drawStringX(x, y, sp, color, 0);
+}
+
+// Blanks only the rectangle the speed number occupies - never the headline
+// above it, and never TIMER_DISPLAY_Y or below, so the bottom clock is
+// untouched by the overspeed blink.
+void blankSpeedNumber(int vehicleSpeed) {
+  int x, y, w, h;
+  getSpeedNumberRect(vehicleSpeed, x, y, w, h);
+  clearDisplay(x, y, x + w, y + h);
+}
+
 void displaySpeed(int vehicleSpeed, int colorCase) {
   PANEL.clearScreen(true);
-  bool overspeed = vehicleSpeed > 100;
+  bool overspeed = vehicleSpeed > OVERSPEED_LIMIT;
+  bool shouldBlink = vehicleSpeed > BLINK_SPEED_LIMIT;
 
   // Same color-case numbering as writeToDisplay()'s fontColour switch.
   int color;
@@ -515,40 +607,63 @@ void displaySpeed(int vehicleSpeed, int colorCase) {
   PANEL.setBrightness(usesRed ? (MaxPanelBrightness / 2) : MaxPanelBrightness);
 
   Headline(overspeed ? "OVERSPEED" : "YOUR SPEED", overspeed ? RED : WHITE);
-  PANEL.selectFont(&font29);
 
-  int n = vehicleSpeed, digitCount = 0;
-  do {
-    n /= 10;
-    ++digitCount;
-  } while (n != 0);
+  // Remember the current speed/color so updateOverspeedBlink() (called from
+  // loop()) can redraw/blank the number without needing new parameters.
+  currentSpeedValue = vehicleSpeed;
+  currentSpeedColor = color;
 
-  int x = 0, y = 0;
-  n = vehicleSpeed;
-  char s[20];
-  sprintf (s, "%ld", n);
-  int first_digit = s[0] - '0';
-
-  if (digitCount == 1) {
-    x = 45; y = 20;
+  if (shouldBlink) {
+    // Speed > 120: (re)start the fixed 5-second blink window. A new SPEED
+    // command received mid-blink restarts this timer from zero.
+    speedBlinkActive = true;
+    speedNumberVisible = true;
+    speedBlinkStart = millis();
+    speedBlinkLastToggle = speedBlinkStart;
   }
-  else if (digitCount == 2) {
-    x = 25; y = 20;
-  }
-  else if (digitCount == 3) {
-    if (first_digit == 1) {
-      x = 15; y = 20;
-    } else if (first_digit > 1) {
-      x = 5; y = 20;
-    }
+  else {
+    // Speed <= 120: no blink, ever. If a blink was in progress for a
+    // previous (higher) speed, this immediately cancels it.
+    speedBlinkActive = false;
+    speedNumberVisible = true;
   }
 
-  char sp[10] = "";
-  sprintf(sp, "%d" , vehicleSpeed);
-
-  PANEL.setTextColor(color, BLACK);
-  PANEL.drawStringX(x, y, sp, color, 0);
+  drawSpeedNumber(vehicleSpeed, color);
   PANEL.swapBuffers(true);
+}
+
+// Advances the non-blocking 5-second overspeed blink. Must be called every
+// loop() iteration; it is a no-op whenever no blink is active. Uses millis()
+// only - never delay() - so Ethernet/heartbeat/timer keep running normally
+// while a blink is in progress.
+void updateOverspeedBlink() {
+  if (!speedBlinkActive)
+    return;
+
+  unsigned long now = millis();
+
+  if (now - speedBlinkStart >= OVERSPEED_BLINK_DURATION) {
+    // 5 seconds elapsed - stop blinking and leave the number permanently visible.
+    speedBlinkActive = false;
+    if (!speedNumberVisible) {
+      speedNumberVisible = true;
+      drawSpeedNumber(currentSpeedValue, currentSpeedColor);
+      PANEL.swapBuffers(true);
+    }
+    return;
+  }
+
+  if (now - speedBlinkLastToggle >= BLINK_INTERVAL) {
+    speedBlinkLastToggle = now;
+    speedNumberVisible = !speedNumberVisible;
+
+    if (speedNumberVisible)
+      drawSpeedNumber(currentSpeedValue, currentSpeedColor);
+    else
+      blankSpeedNumber(currentSpeedValue);
+
+    PANEL.swapBuffers(true);
+  }
 }
 
 void checkHardReset() {
@@ -800,6 +915,9 @@ void loop() {
         parseCommand(str);
         str = "";
     }
+
+    // Non-blocking 5-second overspeed number blink (no-op unless active).
+    updateOverspeedBlink();
 
     // Counter continuously run
     drawTimeCounter();
