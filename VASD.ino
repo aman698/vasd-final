@@ -405,7 +405,11 @@ bool syncNTPTime()
     packetBuffer[14] = 49;
     packetBuffer[15] = 52;
 
-    timeSynced = false;
+    // Do NOT clear timeSynced here. A TIMERIP command can trigger this call
+    // while a previously synced time is already running on the display -
+    // that time must keep running unchanged unless/until this call actually
+    // gets a valid NTP response. timeSynced/baseUnixTime are only touched
+    // below, on the success path.
 
     Serial.println("----- NTP DEBUG -----");
     Serial.print("Local IP: ");
@@ -819,6 +823,14 @@ int parseCommand(String str) {
       // Fourth octet is the remainder of TIMERIP,a,b,c,d - no trailing comma required.
       String fifthValue1  = str.substring(fourthCommaIndex1 + 1);
 
+      // Ethernet commands can arrive with a trailing CR/LF (e.g. telnet
+      // clients), which would otherwise fail isValidOctet() on the last
+      // octet. Trim CR/LF/whitespace off every octet before validating.
+      secondValue1.trim();
+      thirdValue1.trim();
+      fourthValue1.trim();
+      fifthValue1.trim();
+
       if (!isValidOctet(secondValue1) || !isValidOctet(thirdValue1) ||
           !isValidOctet(fourthValue1) || !isValidOctet(fifthValue1))
       {
@@ -829,13 +841,35 @@ int parseCommand(String str) {
         savePCTimerIP(secondValue1.toInt(), thirdValue1.toInt(),
                       fourthValue1.toInt(), fifthValue1.toInt());
 
-        // Only the PC NTP IP is stored here. It is NOT applied immediately -
-        // it takes effect on the next syncNTPTime() call (i.e. next boot).
         Serial.print("PC NTP IP updated: ");
         Serial.print(secondValue1); Serial.print(".");
         Serial.print(thirdValue1);  Serial.print(".");
         Serial.print(fourthValue1); Serial.print(".");
         Serial.println(fifthValue1);
+
+        // Apply the new NTP server immediately instead of waiting for the
+        // next boot. syncNTPTime() re-reads the IP just saved above via
+        // loadPCTimerIP().
+        if (syncNTPTime())
+        {
+          // syncNTPTime() already updated baseUnixTime/timeSynced and saved
+          // the new time to EEPROM on success. Only the running-timer epoch
+          // (timerStart) is this caller's responsibility, same as setup().
+          timerStart = millis();
+
+          Serial.println("Immediate NTP sync succeeded after TIMERIP update.");
+          client.print("TIMERIP,SYNCED");
+        }
+        else
+        {
+          // Sync failed - the new IP stays saved in EEPROM (already
+          // committed above by savePCTimerIP()), and any previously
+          // running valid time is left untouched: syncNTPTime() no longer
+          // clears timeSynced before it has an actual new result, so the
+          // display keeps running on the old baseUnixTime/timerStart.
+          Serial.println("TIMERIP saved, but immediate NTP sync failed. Previous time (if any) keeps running.");
+          client.print("TIMERIP,SAVED,SYNC_FAILED");
+        }
       }
     }
     else if (firstValue == "SPEED") {
