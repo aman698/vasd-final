@@ -58,7 +58,7 @@ uint8_t RGBPinsList[] = { 11, 0, 1, 2, 3, 4, 5 }; // CLK, R0, G0, B0, R1, G1, B1
 #define ETHERNET_SS_PIN 17
 // W5500 module RSTn pin, wired to GPIO24
 #define ETHERNET_RST_PIN 24
-#define HeartBeatLed 26
+#define HeartBeatLed 25
 #define HARDRST 27
 #define LDR -1
 /*
@@ -73,7 +73,6 @@ const int ip_array[4] = {192, 168, 0, 125};
 const int gateway_array[4] = {192, 168, 0, 1};
 const int subnet_array[4] = {255, 255, 255, 0};
 const int dns_array[4] = {192, 168, 0, 1};
-
 // Used only when EEPROM has no valid PC Timer IP yet (first boot / old firmware).
 // Same host that used to act as the local NTP server.
 const int default_pc_timer_ip_array[4] = {192, 168, 0, 11};
@@ -83,7 +82,7 @@ const int default_pc_timer_ip_array[4] = {192, 168, 0, 11};
 #define TIME_ZONE_OFFSET_SECONDS (5 * 3600 + 30 * 60)
 
 /*
-   EEPROM LAYOUT (EEPROM.begin(64) - 64 bytes available, this uses 0-24)
+   EEPROM LAYOUT (EEPROM.begin(64) - 64 bytes available, this uses 0-24, 40-44)
    MCU IP octets       : bytes 0-3   (EEPROM_IP_ADDR .. +3)
    MCU server port     : byte  5     (EEPROM_PORT_ADDR)
    (bytes 6-9 reserved/unused - kept clear as a gap)
@@ -92,10 +91,14 @@ const int default_pc_timer_ip_array[4] = {192, 168, 0, 11};
    (bytes 15-19 reserved/unused - kept clear as a gap)
    Last known unix time: bytes 20-23 (EEPROM_TIME_ADDR, unsigned long, 4 bytes)
    Time-valid flag     : byte  24    (EEPROM_TIME_VALID_ADDR, EEPROM_TIME_VALID_MAGIC = valid)
+   (bytes 25-39 reserved/unused - kept clear as a gap)
+   Max speed limit     : bytes 40-43 (EEPROM_MAX_SPEED_ADDR, int, 4 bytes)
+   Max speed valid flag: byte  44    (EEPROM_MAX_SPEED_VALID_ADDR, EEPROM_MAX_SPEED_VALID_MAGIC = valid)
 
    Each block has its own address range so a SET command can never overwrite
    the PC Timer IP or the saved time, a TIMERIP command can never overwrite
-   the MCU IP, and a time sync can never overwrite either IP.
+   the MCU IP, a time sync can never overwrite either IP, and a MAXLIMIT
+   command can never overwrite any of the above (or vice versa).
 */
 #define EEPROM_IP_ADDR                 0
 #define EEPROM_PORT_ADDR               5
@@ -107,6 +110,12 @@ const int default_pc_timer_ip_array[4] = {192, 168, 0, 11};
 #define EEPROM_TIME_ADDR               20
 #define EEPROM_TIME_VALID_ADDR         24
 #define EEPROM_TIME_VALID_MAGIC        0xAA
+
+#define EEPROM_MAX_SPEED_ADDR        40
+#define EEPROM_MAX_SPEED_VALID_ADDR  44
+#define EEPROM_MAX_SPEED_VALID_MAGIC 0xA5
+
+#define DEFAULT_MAX_SPEED_LIMIT      100
 
 /*
    SERIAL CONFIGS

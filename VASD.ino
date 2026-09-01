@@ -274,7 +274,40 @@ bool loadTimeFromEEPROM(unsigned long &unixTime)
     EEPROM.get(EEPROM_TIME_ADDR, unixTime);
     return true;
 }
+void saveMaxSpeedLimit(int limit)
+{
+    EEPROM.put(EEPROM_MAX_SPEED_ADDR, limit);
 
+    EEPROM.write(
+        EEPROM_MAX_SPEED_VALID_ADDR,
+        EEPROM_MAX_SPEED_VALID_MAGIC
+    );
+
+    EEPROM.commit();
+
+    Serial.print("Max speed limit saved to EEPROM: ");
+    Serial.println(limit);
+}
+
+
+bool loadMaxSpeedLimit(int &limit)
+{
+    if (EEPROM.read(EEPROM_MAX_SPEED_VALID_ADDR)
+        != EEPROM_MAX_SPEED_VALID_MAGIC)
+    {
+        return false;
+    }
+
+    EEPROM.get(EEPROM_MAX_SPEED_ADDR, limit);
+
+    // Safety validation
+    if (limit < 1 || limit > 999)
+    {
+        return false;
+    }
+
+    return true;
+}
 // Reads the PC NTP server IP from EEPROM. Returns false if none has ever
 // been saved (fresh EEPROM, or EEPROM still holding data from older
 // firmware that never wrote this block/magic byte) - the caller decides
@@ -320,6 +353,24 @@ bool isValidOctet(const String &s)
 
     int v = s.toInt();
     return v >= 0 && v <= 255;
+}
+
+// Rejects anything that isn't a plain decimal integer in [1, 999], so a
+// malformed MAXLIMIT command can never silently become 0 through
+// String::toInt() (same rationale as isValidOctet() above).
+bool isValidMaxSpeedToken(const String &s, int &value)
+{
+    if (s.length() == 0 || s.length() > 3)
+        return false;
+
+    for (unsigned int i = 0; i < s.length(); i++)
+    {
+        if (!isDigit(s[i]))
+            return false;
+    }
+
+    value = s.toInt();
+    return value >= 1 && value <= 999;
 }
 
 // Original UDP NTP request/response, unchanged, except the server IP is now
@@ -493,10 +544,11 @@ void Headline(const char* text, int color) {
 }
 
 // ---- SPEED display / overspeed blink thresholds ----
-#define OVERSPEED_LIMIT 100
-#define BLINK_SPEED_LIMIT 120
-#define OVERSPEED_BLINK_DURATION 5000UL
-#define BLINK_INTERVAL 500UL
+// DEFAULT_MAX_SPEED_LIMIT is defined in config.h (also used by the EEPROM
+// load/save functions), so it is not redefined here.
+int maxSpeedLimit = DEFAULT_MAX_SPEED_LIMIT;
+#define OVERSPEED_BLINK_DURATION 10000UL
+#define BLINK_INTERVAL 300UL
 
 // State for the non-blocking overspeed blink, updated by displaySpeed() and
 // consumed every loop() iteration by updateOverspeedBlink(). Only the speed
@@ -581,8 +633,8 @@ void blankSpeedNumber(int vehicleSpeed) {
 
 void displaySpeed(int vehicleSpeed, int colorCase) {
   PANEL.clearScreen(true);
-  bool overspeed = vehicleSpeed > OVERSPEED_LIMIT;
-  bool shouldBlink = vehicleSpeed > BLINK_SPEED_LIMIT;
+  bool overspeed = vehicleSpeed > maxSpeedLimit;
+  bool shouldBlink = vehicleSpeed > maxSpeedLimit;
 
   // Same color-case numbering as writeToDisplay()'s fontColour switch.
   int color;
@@ -806,6 +858,41 @@ int parseCommand(String str) {
       client.print(" ");
       client.print(colorCase);
     }
+    else if (firstValue == "MAXLIMIT") {
+      // MAXLIMIT,<value> - a single value, so the generic secondValue
+      // computed above (everything after the first comma) is exactly the
+      // value token; no extra comma-splitting is needed like SET/TIMERIP.
+      int newLimit;
+
+      if (!isValidMaxSpeedToken(secondValue, newLimit))
+      {
+        // Distinguish "not a plain number" from "number out of range"
+        // instead of relying on String::toInt()'s silent 0-on-garbage.
+        bool allDigits = secondValue.length() > 0;
+        for (unsigned int i = 0; i < secondValue.length(); i++) {
+          if (!isDigit(secondValue[i])) { allDigits = false; break; }
+        }
+
+        if (allDigits) {
+          client.print("ERROR,MAXLIMIT,RANGE");
+          Serial.println("MAXLIMIT rejected: value out of range.");
+        } else {
+          client.print("ERROR,MAXLIMIT,INVALID");
+          Serial.println("MAXLIMIT rejected: invalid value.");
+        }
+      }
+      else
+      {
+        maxSpeedLimit = newLimit;
+        saveMaxSpeedLimit(maxSpeedLimit);
+
+        client.print("MAXLIMIT,");
+        client.print(maxSpeedLimit);
+
+        Serial.print("Max speed limit updated via Ethernet: ");
+        Serial.println(maxSpeedLimit);
+      }
+    }
   }
   return -1;
 }
@@ -842,7 +929,24 @@ void setup() {
   digitalWrite(ETHERNET_RST_PIN, HIGH);
   delay(150);
   Ethernet.init(ETHERNET_SS_PIN);
+  int savedMaxSpeed;
 
+if (loadMaxSpeedLimit(savedMaxSpeed))
+{
+    maxSpeedLimit = savedMaxSpeed;
+
+    Serial.print("Loaded Max Speed Limit from EEPROM: ");
+    Serial.println(maxSpeedLimit);
+}
+else
+{
+    maxSpeedLimit = DEFAULT_MAX_SPEED_LIMIT;
+
+    Serial.print("Using Default Max Speed Limit: ");
+    Serial.println(maxSpeedLimit);
+
+    saveMaxSpeedLimit(maxSpeedLimit);
+}
   Serial.print("PORT:");
   int port = SERVER_PORT;
   if (EEPROM.read(EEPROM_PORT_ADDR) < 254) {
